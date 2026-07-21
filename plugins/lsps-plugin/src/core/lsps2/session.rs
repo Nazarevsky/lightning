@@ -25,6 +25,18 @@ pub enum Error {
     },
 }
 
+/// A reason of why the JIT channel funding procedure failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FundingFailedReason {
+    /// Insufficient UTXOs to meet the desired amount.
+    InsufficientFunds,
+
+    /// Unknown failing reason. It is really unlikely to catch this reason.
+    /// However, it makes sense in case of some new errors that might be
+    /// added to RPC calls behind the funding channel procedure.
+    Unknown(String),
+}
+
 type Result<T> = std::result::Result<T, Error>;
 
 // Amount conventions in this module: values that cross the LSPS2 wire or
@@ -79,7 +91,7 @@ pub enum SessionInput {
     /// Timeout waiting for parts to arrive from blip052: defaults to 90s.
     CollectTimeout,
     /// Channel funding failed.
-    FundingFailed,
+    FundingFailed { reason: FundingFailedReason },
     /// Zero-conf channel funded, withheld, and ready.
     ChannelReady {
         channel_id: String,
@@ -160,6 +172,9 @@ pub enum SessionEvent {
     },
     FundingBroadcasted {
         funding_psbt: String,
+    },
+    FundingFailed {
+        reason: FundingFailedReason
     },
     SessionFailed,
     SessionAbandoned,
@@ -530,7 +545,7 @@ impl Session {
                 | SessionInput::PaymentSettled
                 | SessionInput::PaymentFailed { .. }
                 | SessionInput::FundingBroadcasted
-                | SessionInput::FundingFailed
+                | SessionInput::FundingFailed { .. }
                 | SessionInput::ChannelClosed { .. }),
             ) => Ok(ApplyResult::unusual_input(&self.state, input)),
 
@@ -653,7 +668,7 @@ impl Session {
                 // we don't care anymore.
                 Ok(ApplyResult::unusual_input(&self.state, input))
             }
-            (SessionState::AwaitingChannelReady { .. }, SessionInput::FundingFailed) => {
+            (SessionState::AwaitingChannelReady { .. }, SessionInput::FundingFailed { reason }) => {
                 // LSPS2: a client disconnect before funding_signed MUST be
                 // failed with temporary_channel_failure so the payer knows
                 // it can retry. We can't currently distinguish an explicit
@@ -668,7 +683,10 @@ impl Session {
                         SessionAction::Disconnect,
                         SessionAction::FailSession,
                     ],
-                    events: vec![SessionEvent::SessionFailed],
+                    events: vec![
+                        SessionEvent::SessionFailed,
+                        SessionEvent::FundingFailed { reason },
+                    ],
                 })
             }
             (
@@ -844,7 +862,7 @@ impl Session {
                 SessionState::AwaitingSettlement { .. },
                 ref input @ (SessionInput::CollectTimeout
                 | SessionInput::ChannelReady { .. }
-                | SessionInput::FundingFailed
+                | SessionInput::FundingFailed { .. }
                 | SessionInput::FundingBroadcasted
                 | SessionInput::ChannelClosed { .. }
                 | SessionInput::NewBlock { .. }),
@@ -901,7 +919,7 @@ impl Session {
                 ref input @ (SessionInput::CollectTimeout
                 | SessionInput::ChannelReady { .. }
                 | SessionInput::PaymentSettled
-                | SessionInput::FundingFailed
+                | SessionInput::FundingFailed { .. }
                 | SessionInput::PaymentFailed { .. }
                 | SessionInput::ChannelClosed { .. }
                 | SessionInput::NewBlock { .. }),
@@ -1861,7 +1879,11 @@ mod tests {
 
         assert!(matches!(s.state, SessionState::AwaitingChannelReady { .. }));
 
-        let res = s.apply(SessionInput::FundingFailed).unwrap();
+        let res = s
+            .apply(SessionInput::FundingFailed {
+                reason: FundingFailedReason::Unknown("unknown error".to_string()),
+            })
+            .unwrap();
 
         assert_eq!(s.state, SessionState::Failed);
         assert_eq!(
@@ -1874,7 +1896,15 @@ mod tests {
                 SessionAction::FailSession,
             ]
         );
-        assert_eq!(res.events, vec![SessionEvent::SessionFailed]);
+        assert_eq!(
+            res.events,
+            vec![
+                SessionEvent::SessionFailed,
+                SessionEvent::FundingFailed {
+                    reason: FundingFailedReason::Unknown("unknown error".to_string()),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1896,17 +1926,33 @@ mod tests {
             .apply(SessionInput::AddPart { part: part(3, 500) })
             .unwrap();
 
-        let res = s.apply(SessionInput::FundingFailed).unwrap();
+        let res = s
+            .apply(SessionInput::FundingFailed {
+                reason: FundingFailedReason::Unknown("unknown error".to_string()),
+            })
+            .unwrap();
 
         assert_eq!(s.state, SessionState::Failed);
-        assert_eq!(res.events, vec![SessionEvent::SessionFailed]);
+        assert_eq!(
+            res.events,
+            vec![
+                SessionEvent::SessionFailed,
+                SessionEvent::FundingFailed {
+                    reason: FundingFailedReason::Unknown("unknown error".to_string()),
+                },
+            ]
+        );
     }
 
     #[test]
     fn collecting_unexpected_funding_failed_emits_unusual_input() {
         let mut s = session(3, Some(2_000), 1);
 
-        let res = s.apply(SessionInput::FundingFailed).unwrap();
+        let res = s
+            .apply(SessionInput::FundingFailed {
+                reason: FundingFailedReason::Unknown("unknown error".to_string()),
+            })
+            .unwrap();
 
         assert!(matches!(s.state, SessionState::Collecting { .. }));
         assert!(res.actions.is_empty());
@@ -1928,7 +1974,12 @@ mod tests {
                 part: part(2, 1_000),
             })
             .unwrap();
-        let _ = s.apply(SessionInput::FundingFailed).unwrap();
+
+        let _ = s
+            .apply(SessionInput::FundingFailed {
+                reason: FundingFailedReason::Unknown("unknown error".to_string()),
+            })
+            .unwrap();
 
         assert!(s.is_terminal());
 
@@ -2217,7 +2268,9 @@ mod tests {
 
         for input in [
             SessionInput::CollectTimeout,
-            SessionInput::FundingFailed,
+            SessionInput::FundingFailed {
+                reason: FundingFailedReason::Unknown("unknown error".to_string()),
+            },
             SessionInput::FundingBroadcasted,
             SessionInput::NewBlock { height: 100 },
         ] {
@@ -2251,7 +2304,9 @@ mod tests {
 
         for input in [
             SessionInput::CollectTimeout,
-            SessionInput::FundingFailed,
+            SessionInput::FundingFailed {
+                reason: FundingFailedReason::Unknown("unknown error".to_string()),
+            },
             SessionInput::PaymentFailed { htlc_id: None },
             SessionInput::NewBlock { height: 100 },
         ] {

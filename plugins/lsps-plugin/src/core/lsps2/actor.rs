@@ -2,7 +2,10 @@ use crate::{
     core::lsps2::{
         event_sink::{EventSink, SessionEventEnvelope},
         provider::DatastoreProvider,
-        session::{HtlcId, PaymentPart, Session, SessionAction, SessionEvent, SessionInput},
+        session::{
+            FundingFailedReason, HtlcId, PaymentPart, Session, SessionAction, SessionEvent,
+            SessionInput,
+        },
     },
     proto::{
         lsps0::{Msat, ShortChannelId},
@@ -39,7 +42,9 @@ enum ActorInput {
         channel_id: String,
         funding_psbt: String,
     },
-    FundingFailed,
+    FundingFailed {
+        reason: FundingFailedReason,
+    },
     PaymentSettled {
         preimage: Option<String>,
         updated_index: Option<u64>,
@@ -259,7 +264,7 @@ impl<A: ActionExecutor + Clone + Send + 'static, D: DatastoreProvider + Clone + 
                     funding_psbt,
                 })
             }
-            ActorInput::FundingFailed => Some(SessionInput::FundingFailed),
+            ActorInput::FundingFailed { reason } => Some(SessionInput::FundingFailed { reason }),
             ActorInput::PaymentSettled {
                 preimage,
                 updated_index,
@@ -481,7 +486,18 @@ impl<A: ActionExecutor + Clone + Send + 'static, D: DatastoreProvider + Clone + 
                         }
                         Err(e) => {
                             warn!("fund_channel failed: {e}");
-                            let _ = self_tx.send(ActorInput::FundingFailed).await;
+
+                            // Under the hood, fund_channel performes a serie of RPC calls.
+                            // fund_psbt, which is also called, may return an error which 
+                            // starts with 301 status code indicating insufficient funds.
+                            let reason =
+                                if e.chain().any(|cause| cause.to_string().starts_with("301")) {
+                                    FundingFailedReason::InsufficientFunds
+                                } else {
+                                    FundingFailedReason::Unknown(e.to_string())
+                                };
+
+                            let _ = self_tx.send(ActorInput::FundingFailed { reason }).await;
                         }
                     }
                 });
