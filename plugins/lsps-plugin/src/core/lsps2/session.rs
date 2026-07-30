@@ -8,6 +8,7 @@ use crate::proto::{
         OpeningFeeParams, SessionOutcome,
     },
 };
+use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -26,7 +27,7 @@ pub enum Error {
 }
 
 /// A reason of why the JIT channel funding procedure failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum FundingFailedReason {
     /// Insufficient UTXOs to meet the desired amount.
     InsufficientFunds,
@@ -54,20 +55,20 @@ pub const CLTV_SAFETY_BUFFER: u32 = 6;
 /// Identifies an incoming HTLC. The protocol numbers HTLCs per channel, so
 /// MPP parts arriving over different incoming channels can carry the same
 /// `id`; the incoming channel's scid is needed to disambiguate them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct HtlcId {
     pub scid: ShortChannelId,
     pub id: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaymentPart {
     pub htlc_id: HtlcId,
     pub amount_msat: Msat,
     pub cltv_expiry: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ForwardPart {
     pub htlc_id: HtlcId,
     pub fee_msat: u64,
@@ -136,7 +137,7 @@ pub enum SessionAction {
     Disconnect,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum SessionEvent {
     PaymentPartAdded {
         part: PaymentPart,

@@ -1,10 +1,11 @@
 use crate::core::lsps2::session::SessionEvent;
 use crate::proto::lsps0::ShortChannelId;
 use bitcoin::hashes::sha256::Hash as PaymentHash;
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SessionEventEnvelope {
     pub scid: ShortChannelId,
     pub payment_hash: PaymentHash,
