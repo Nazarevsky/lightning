@@ -13,12 +13,13 @@ use cln_lsps::{
     core::{
         lsps2::{
             actor::HtlcResponse,
-            event_sink::NoopEventSink,
+            event_sink::{ChannelEventSink, EventSink, SessionEventEnvelope},
             manager::{ManagerError, PaymentHash, SessionConfig, SessionManager},
             provider::{DatastoreProvider, RecoveryProvider},
             service::Lsps2ServiceHandler,
             session::{HtlcId, PaymentPart},
         },
+        notification::{self, LspNotification},
         server::LspsService,
         tlv::{TLV_FORWARD_AMT, TlvStream},
     },
@@ -27,10 +28,11 @@ use cln_lsps::{
         lsps2::failure_codes::{TEMPORARY_CHANNEL_FAILURE, UNKNOWN_NEXT_PEER},
     },
 };
-use cln_plugin::{HookBuilder, HookFilter, Plugin, options};
+use cln_plugin::{HookBuilder, HookFilter, Plugin, messages::NotificationTopic, options};
 use log::{debug, error, trace, warn};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 pub const OPTION_ENABLED: options::FlagConfigOption = options::ConfigOption::new_flag(
     "experimental-lsps2-service",
@@ -69,11 +71,12 @@ struct State {
 }
 
 impl State {
-    pub fn new(
+    pub fn new<E: EventSink + 'static>(
         rpc_path: PathBuf,
         promise_secret: &[u8; 32],
         collect_timeout_secs: u64,
         zero_reserve: bool,
+        event_sink: E,
     ) -> Self {
         let rpc = ClnRpcClient::new(rpc_path.clone());
         let sender = ClnSender::new(rpc_path);
@@ -94,7 +97,7 @@ impl State {
                 collect_timeout_secs,
                 ..SessionConfig::default()
             },
-            Arc::new(NoopEventSink),
+            Arc::new(event_sink),
         ));
         Self {
             lsps_service,
@@ -143,6 +146,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .hook("htlc_accepted", on_htlc_accepted)
         .subscribe("forward_event", on_forward_event)
         .subscribe("block_added", on_block_added)
+        .notification(NotificationTopic::new(notification::LSPS2_SESSION_EVENT_TOPIC))
         .configure()
         .await?
     {
@@ -180,7 +184,10 @@ async fn main() -> Result<(), anyhow::Error> {
 
                 let collect_timeout_secs = plugin.option(&OPTION_COLLECT_TIMEOUT)? as u64;
                 let zero_reserve = plugin.option(&OPTION_ZERO_RESERVE)?;
-                let state = State::new(rpc_path, &secret, collect_timeout_secs, zero_reserve);
+
+                let (event_sink, event_rx) = ChannelEventSink::new();
+
+                let state = State::new(rpc_path, &secret, collect_timeout_secs, zero_reserve, event_sink);
 
                 // Recover in-flight sessions before processing replayed HTLCs
                 let recovery: Arc<dyn RecoveryProvider> = state.recovery.clone();
@@ -189,6 +196,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
 
                 let plugin = plugin.start(state).await?;
+                tokio::spawn(handle_session_events(plugin.clone(), event_rx));
                 plugin.join().await
             } else {
                 bail!("lsps2 enabled but no promise-secret set.");
@@ -438,6 +446,38 @@ fn json_fail(failure_code: &str) -> serde_json::Value {
         "result": "fail",
         "failure_message": failure_code
     })
+}
+
+async fn handle_session_events(
+    plugin: Plugin<State>,
+    mut rx: mpsc::UnboundedReceiver<SessionEventEnvelope>,
+) {
+    while let Some(envelope) = rx.recv().await {
+        debug!("session event: {envelope:?}");
+        publish_notification(&plugin, envelope.into()).await;
+    }
+}
+
+/// Publishes any `LspNotification` under its topic. Generic across
+/// notification kinds so future non-session notifications reuse this same
+/// path instead of a bespoke publisher.
+async fn publish_notification(plugin: &Plugin<State>, notification: LspNotification) {
+    let topic = notification.topic();
+
+    let payload = match serde_json::to_value(&notification) {
+        Ok(value) => value,
+        Err(e) => {
+            warn!("failed to serialize {topic} notification: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = plugin
+        .send_custom_notification(topic.to_string(), payload)
+        .await
+    {
+        warn!("failed to send {topic} notification: {e}");
+    }
 }
 
 #[cfg(test)]
