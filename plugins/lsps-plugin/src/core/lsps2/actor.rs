@@ -485,7 +485,7 @@ impl<A: ActionExecutor + Clone + Send + 'static, D: DatastoreProvider + Clone + 
                                 .await;
                         }
                         Err(e) => {
-                            warn!("fund_channel failed: {e}");
+                            warn!("fund_channel failed: {e}, {0}", e.chain().len());
                             debug!("fund_channel failed: {e}, {0}", e.chain().len());
 
                             for cause in e.chain() {
