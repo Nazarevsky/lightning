@@ -356,7 +356,7 @@ impl Session {
         let min = cltv_min(parts)?;
         if height.saturating_add(CLTV_SAFETY_BUFFER) >= min {
             self.state = SessionState::Failed;
-            debug!("session failed 1");
+            info!("session failed 1");
             Some(ApplyResult {
                 actions: vec![
                     SessionAction::FailHtlcs {
@@ -405,7 +405,7 @@ impl Session {
                             // says we MAY use the latter).
                             self.state = SessionState::Failed;
                             events.push(SessionEvent::TooManyParts { n_parts });
-                            debug!("session failed 2");
+                            info!("session failed 2");
                             events.push(SessionEvent::SessionFailed);
                             return Ok(ApplyResult {
                                 actions: vec![
@@ -426,7 +426,7 @@ impl Session {
                             self.state = SessionState::Failed;
                             events.push(SessionEvent::TooManyParts { n_parts });
                             events.push(SessionEvent::SessionFailed);
-                            debug!("session failed 3");
+                            info!("session failed 3");
                             return Ok(ApplyResult {
                                 actions: vec![
                                     SessionAction::FailHtlcs {
@@ -461,7 +461,7 @@ impl Session {
                         self.opening_fee_params.proportional.ppm() as u64,
                     ) else {
                         self.state = SessionState::Failed;
-                        debug!("session failed 4");
+                        info!("session failed 4");
                         events.push(SessionEvent::SessionFailed);
                         return Ok(ApplyResult {
                             actions: vec![
@@ -485,7 +485,7 @@ impl Session {
                             n_parts,
                             parts_sum,
                         });
-                        debug!("session failed 5");
+                        info!("session failed 5");
                         events.push(SessionEvent::SessionFailed);
                         return Ok(ApplyResult {
                             actions: vec![
@@ -529,7 +529,7 @@ impl Session {
                 let parts_sum = parts.iter().map(|p| p.amount_msat).sum();
 
                 self.state = SessionState::Failed;
-                debug!("session failed 6");
+                info!("session failed 6");
                 Ok(ApplyResult {
                     actions: vec![
                         SessionAction::FailHtlcs {
@@ -683,7 +683,7 @@ impl Session {
                 // client reject (which LSPS2 fails with unknown_next_peer)
                 // from other funding errors, so prefer the retryable code.
                 self.state = SessionState::Failed;
-                debug!("session failed 7");
+                info!("session failed 7");
                 Ok(ApplyResult {
                     actions: vec![
                         SessionAction::FailHtlcs {
