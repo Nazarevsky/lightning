@@ -12,11 +12,11 @@ use crate::{
         lsps2::{DatastoreEntry, OpeningFeeParams},
     },
 };
-use anyhow::Result;
+use anyhow::{format_err, Result};
 use async_trait::async_trait;
 use bitcoin::hashes::sha256::Hash as PaymentHash;
 use bitcoin::hashes::Hash;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
@@ -488,9 +488,14 @@ impl<A: ActionExecutor + Clone + Send + 'static, D: DatastoreProvider + Clone + 
                             warn!("fund_channel failed: {e}");
                             debug!("fund_channel failed: {e}");
 
+                            for cause in e.chain() {
+                                info!("{}", cause);
+                            }
+
                             // Under the hood, fund_channel performes a serie of RPC calls.
                             // fund_psbt, which is also called, may return an error which 
                             // starts with 301 status code indicating insufficient funds.
+                            // let a = e.chain().map(|a| info!("{}", a));
                             let reason =
                                 if e.chain().any(|cause| cause.to_string().starts_with("301")) {
                                     FundingFailedReason::InsufficientFunds
