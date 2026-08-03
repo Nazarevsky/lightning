@@ -1,532 +1,533 @@
-use anyhow::bail;
-use bitcoin::hashes::Hash;
-use cln_lsps::{
-    cln_adapters::{
-        hooks::service_custommsg_hook,
-        rpc::{
-            ClnActionExecutor, ClnDatastore, ClnPolicyProvider, ClnRecoveryProvider, ClnRpcClient,
-        },
-        sender::ClnSender,
-        state::ServiceState,
-        types::HtlcAcceptedRequest,
-    },
-    core::{
-        lsps2::{
-            actor::HtlcResponse,
-            event_sink::{ChannelEventSink, EventSink, SessionEventEnvelope},
-            manager::{ManagerError, PaymentHash, SessionConfig, SessionManager},
-            provider::{DatastoreProvider, RecoveryProvider},
-            service::Lsps2ServiceHandler,
-            session::{HtlcId, PaymentPart},
-        },
-        notification::{self, LspNotification},
-        server::LspsService,
-        tlv::{TLV_FORWARD_AMT, TlvStream},
-    },
-    proto::{
-        lsps0::{LSPS0_MESSAGE_TYPE, Msat, ShortChannelId},
-        lsps2::failure_codes::{TEMPORARY_CHANNEL_FAILURE, UNKNOWN_NEXT_PEER},
-    },
-};
-use cln_plugin::{HookBuilder, HookFilter, Plugin, messages::NotificationTopic, options};
-use log::{debug, error, trace, warn};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::mpsc;
-
-pub const OPTION_ENABLED: options::FlagConfigOption = options::ConfigOption::new_flag(
-    "experimental-lsps2-service",
-    "Enables lsps2 for the LSP service",
-);
-
-pub const OPTION_PROMISE_SECRET: options::StringConfigOption =
-    options::ConfigOption::new_str_no_default(
-        "experimental-lsps2-promise-secret",
-        "A 64-character hex string that is the secret for promises",
-    );
-
-pub const OPTION_COLLECT_TIMEOUT: options::DefaultIntegerConfigOption =
-    options::ConfigOption::new_i64_with_default(
-        "dev-lsps2-collect-timeout",
-        90,
-        "Timeout in seconds for collecting MPP parts (default: 90)",
-    );
-
-/// Opt-in: require no channel reserve from the client on JIT channels.
-/// Left unset by default as some implementations cannot handle an explicit
-/// zero reserve.
-pub const OPTION_ZERO_RESERVE: options::FlagConfigOption = options::ConfigOption::new_flag(
-    "experimental-lsps2-zero-reserve",
-    "Require no channel reserve from the client on JIT channels",
-);
-
-#[derive(Clone)]
-struct State {
-    lsps_service: Arc<LspsService>,
-    sender: ClnSender,
-    lsps2_enabled: bool,
-    datastore: Arc<ClnDatastore>,
-    recovery: Arc<ClnRecoveryProvider>,
-    session_manager: Arc<SessionManager<ClnDatastore, ClnActionExecutor>>,
-}
-
-impl State {
-    pub fn new<E: EventSink + 'static>(
-        rpc_path: PathBuf,
-        promise_secret: &[u8; 32],
-        collect_timeout_secs: u64,
-        zero_reserve: bool,
-        event_sink: E,
-    ) -> Self {
-        let rpc = ClnRpcClient::new(rpc_path.clone());
-        let sender = ClnSender::new(rpc_path);
-        let datastore = Arc::new(ClnDatastore::new(rpc.clone()));
-        let policy = Arc::new(ClnPolicyProvider::new(rpc.clone()));
-        let executor = Arc::new(ClnActionExecutor::new(rpc.clone(), zero_reserve));
-        let recovery = Arc::new(ClnRecoveryProvider::new(rpc));
-        let lsps2_handler = Arc::new(Lsps2ServiceHandler::new(
-            datastore.clone(),
-            policy,
-            promise_secret,
-        ));
-        let lsps_service = Arc::new(LspsService::builder().with_protocol(lsps2_handler).build());
-        let session_manager = Arc::new(SessionManager::new(
-            datastore.clone(),
-            executor,
-            SessionConfig {
-                collect_timeout_secs,
-                ..SessionConfig::default()
-            },
-            Arc::new(event_sink),
-        ));
-        Self {
-            lsps_service,
-            sender,
-            lsps2_enabled: true,
-            datastore,
-            recovery,
-            session_manager,
-        }
-    }
-}
-
-impl ServiceState for State {
-    fn service(&self) -> Arc<LspsService> {
-        self.lsps_service.clone()
-    }
-
-    fn sender(&self) -> cln_lsps::cln_adapters::sender::ClnSender {
-        self.sender.clone()
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    debug!("startstartstart");
-    if let Some(plugin) = cln_plugin::Builder::new(tokio::io::stdin(), tokio::io::stdout())
-        .option(OPTION_ENABLED)
-        .option(OPTION_PROMISE_SECRET)
-        .option(OPTION_COLLECT_TIMEOUT)
-        .option(OPTION_ZERO_RESERVE)
-        // FIXME: Temporarily disabled lsp feature to please test cases, this is
-        // ok as the feature is optional per spec.
-        // We need to ensure that `connectd` only starts after all plugins have
-        // been initialized.
-        // .featurebits(
-        //     cln_plugin::FeatureBitsKind::Node,
-        //     util::feature_bit_to_hex(LSP_FEATURE_BIT),
-        // )
-        // .featurebits(
-        //     cln_plugin::FeatureBitsKind::Init,
-        //     util::feature_bit_to_hex(LSP_FEATURE_BIT),
-        // )
-        .hook_from_builder(
-            HookBuilder::new("custommsg", service_custommsg_hook)
-                .filters(vec![HookFilter::Int(i64::from(LSPS0_MESSAGE_TYPE))]),
-        )
-        .hook("htlc_accepted", on_htlc_accepted)
-        .subscribe("forward_event", on_forward_event)
-        .subscribe("block_added", on_block_added)
-        .notification(NotificationTopic::new(notification::LSPS2_SESSION_EVENT_TOPIC))
-        .configure()
-        .await?
-    {
-        let rpc_path =
-            Path::new(&plugin.configuration().lightning_dir).join(&plugin.configuration().rpc_file);
-
-        if plugin.option(&OPTION_ENABLED)? {
-            log::debug!("lsps2-service enabled");
-            if let Some(secret_hex) = plugin.option(&OPTION_PROMISE_SECRET)? {
-                let secret_hex = secret_hex.trim().to_lowercase();
-
-                let decoded_bytes = match hex::decode(&secret_hex) {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        return plugin
-                            .disable(&format!(
-                                "Invalid hex string for promise secret: {}",
-                                secret_hex
-                            ))
-                            .await;
-                    }
-                };
-
-                let secret: [u8; 32] = match decoded_bytes.try_into() {
-                    Ok(array) => array,
-                    Err(vec) => {
-                        return plugin
-                            .disable(&format!(
-                                "Promise secret must be exactly 32 bytes, got {}",
-                                vec.len()
-                            ))
-                            .await;
-                    }
-                };
-
-                let collect_timeout_secs = plugin.option(&OPTION_COLLECT_TIMEOUT)? as u64;
-                let zero_reserve = plugin.option(&OPTION_ZERO_RESERVE)?;
-
-                let (event_sink, event_rx) = ChannelEventSink::new();
-
-                let state = State::new(rpc_path, &secret, collect_timeout_secs, zero_reserve, event_sink);
-
-                // Recover in-flight sessions before processing replayed HTLCs
-                let recovery: Arc<dyn RecoveryProvider> = state.recovery.clone();
-                if let Err(e) = state.session_manager.recover(recovery).await {
-                    warn!("session recovery failed: {e}");
-                }
-
-                let plugin = plugin.start(state).await?;
-                tokio::spawn(handle_session_events(plugin.clone(), event_rx));
-                plugin.join().await
-            } else {
-                bail!("lsps2 enabled but no promise-secret set.");
-            }
-        } else {
-            return plugin
-                .disable(&format!("`{}` not enabled", &OPTION_ENABLED.name))
-                .await;
-        }
-    } else {
-        Ok(())
-    }
-}
-
-async fn on_htlc_accepted(
-    p: Plugin<State>,
-    v: serde_json::Value,
-) -> Result<serde_json::Value, anyhow::Error> {
-    Ok(handle_htlc_safe(&p, v).await)
-}
-
-async fn handle_htlc_safe(p: &Plugin<State>, v: serde_json::Value) -> serde_json::Value {
-    match handle_htlc_inner(p, v).await {
-        Ok(response) => response,
-        Err(e) => {
-            error!("HTLC hook error (continuing): {:#}", e);
-            json_continue()
-        }
-    }
-}
-
-async fn handle_htlc_inner(
-    p: &Plugin<State>,
-    v: serde_json::Value,
-) -> Result<serde_json::Value, anyhow::Error> {
-    if !p.state().lsps2_enabled {
-        return Ok(json_continue());
-    }
-
-    let req: HtlcAcceptedRequest = serde_json::from_value(v)?;
-
-    let short_channel_id: ShortChannelId = match req.onion.short_channel_id {
-        Some(scid) => scid.into(),
-        None => {
-            trace!("We are the destination of the HTLC, continue.");
-            return Ok(json_continue());
-        }
-    };
-
-    // Probe: an scid we have no buy request for is not ours. Everything
-    // else about the entry — expiry included — is the session manager's
-    // call, so that it can tell a stale offer from a live session.
-    if p.state()
-        .datastore
-        .get_buy_request(&short_channel_id)
-        .await
-        .is_err()
-    {
-        trace!("SCID not ours, continue.");
-        return Ok(json_continue());
-    }
-
-    handle_session_htlc(p, &req, short_channel_id).await
-}
-
-async fn handle_session_htlc(
-    p: &Plugin<State>,
-    req: &HtlcAcceptedRequest,
-    scid: ShortChannelId,
-) -> Result<serde_json::Value, anyhow::Error> {
-    let payment_hash = PaymentHash::from_byte_array(req.htlc.payment_hash.as_slice().try_into()?);
-    let part = PaymentPart {
-        // HTLC ids are per-channel; key by the incoming channel too so MPP
-        // parts arriving over different channels cannot collide.
-        htlc_id: HtlcId {
-            scid: req.htlc.short_channel_id.into(),
-            id: req.htlc.id,
-        },
-        amount_msat: Msat::from_msat(req.htlc.amount_msat.msat()),
-        cltv_expiry: req.htlc.cltv_expiry,
-    };
-    match p
-        .state()
-        .session_manager
-        .on_part(payment_hash, scid, part)
-        .await
-    {
-        Ok(resp) => session_response_to_json(
-            resp,
-            &req.onion.payload,
-            req.htlc.amount_msat.msat(),
-            &req.htlc.extra_tlvs,
-        ),
-        Err(e) => {
-            debug!("session manager error: {e:#}");
-            match e {
-                // The scid points at us but no session can serve this part
-                // right now; tell the payer it may retry.
-                ManagerError::SessionTerminated | ManagerError::SessionAlreadyFunded => {
-                    Ok(json_fail(TEMPORARY_CHANNEL_FAILURE))
-                }
-                // The offer is past valid_until: permanent for this scid.
-                ManagerError::OfferExpired => Ok(json_fail(UNKNOWN_NEXT_PEER)),
-                ManagerError::DatastoreLookup(_) => Ok(json_continue()),
-            }
-        }
-    }
-}
-
-fn session_response_to_json(
-    resp: HtlcResponse,
-    payload: &TlvStream,
-    _htlc_amount_msat: u64,
-    extra_tlvs: &Option<TlvStream>,
-) -> Result<serde_json::Value, anyhow::Error> {
-    match resp {
-        HtlcResponse::Forward {
-            channel_id,
-            fee_msat,
-            forward_msat,
-        } => {
-            let mut payload = payload.clone();
-            payload.set_tu64(TLV_FORWARD_AMT, forward_msat);
-
-            let mut extra_tlvs = extra_tlvs.clone().unwrap_or_default();
-            // LSPS2: the extra_fee TLV MUST NOT be included on parts that
-            // have no fee deducted.
-            if fee_msat > 0 {
-                extra_tlvs.set_u64(65537, fee_msat);
-            }
-
-            let forward_to = hex::decode(&channel_id)?;
-
-            Ok(json_continue_forward(
-                payload.to_bytes()?,
-                forward_to,
-                extra_tlvs.to_bytes()?,
-            ))
-        }
-        HtlcResponse::Fail { failure_code } => Ok(json_fail(failure_code)),
-        HtlcResponse::Continue => Ok(json_continue()),
-    }
-}
-
-async fn on_forward_event(p: Plugin<State>, v: serde_json::Value) -> Result<(), anyhow::Error> {
-    let event = match v.get("forward_event") {
-        Some(e) => e,
-        None => return Ok(()),
-    };
-
-    let status = event.get("status").and_then(|s| s.as_str());
-
-    let payment_hash = match status {
-        Some("settled") | Some("failed") | Some("local_failed") => {
-            let hash_hex = match event.get("payment_hash").and_then(|s| s.as_str()) {
-                Some(h) => h,
-                None => return Ok(()),
-            };
-            let bytes: [u8; 32] = hex::decode(hash_hex)?
-                .try_into()
-                .map_err(|v: Vec<u8>| anyhow::anyhow!("bad payment_hash len {}", v.len()))?;
-            PaymentHash::from_byte_array(bytes)
-        }
-        _ => return Ok(()),
-    };
-
-    let updated_index = event.get("updated_index").and_then(|v| v.as_u64());
-
-    match status {
-        Some("settled") => {
-            let preimage = event
-                .get("preimage")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-
-            if let Err(e) = p
-                .state()
-                .session_manager
-                .on_payment_settled(payment_hash, preimage, updated_index)
-                .await
-            {
-                debug!("on_payment_settled error: {e:#}");
-            }
-        }
-        Some("failed") | Some("local_failed") => {
-            // Identify the failed part when possible so the session can
-            // keep waiting on its other, still-offered parts.
-            let failed_htlc = match (
-                event
-                    .get("in_channel")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<ShortChannelId>().ok()),
-                event.get("in_htlc_id").and_then(|v| v.as_u64()),
-            ) {
-                (Some(scid), Some(id)) => Some(HtlcId { scid, id }),
-                _ => None,
-            };
-
-            if let Err(e) = p
-                .state()
-                .session_manager
-                .on_payment_failed(payment_hash, updated_index, failed_htlc)
-                .await
-            {
-                debug!("on_payment_failed error: {e:#}");
-            }
-        }
-        _ => unreachable!(),
-    }
-
-    Ok(())
-}
-
-async fn on_block_added(p: Plugin<State>, v: serde_json::Value) -> Result<(), anyhow::Error> {
-    let height = match v
-        .get("block_added")
-        .and_then(|b| b.get("height"))
-        .and_then(|h| h.as_u64())
-    {
-        Some(h) => h as u32,
-        None => return Ok(()),
-    };
-
-    p.state().session_manager.on_new_block(height).await;
-    Ok(())
-}
-
-fn json_continue() -> serde_json::Value {
-    serde_json::json!({"result": "continue"})
-}
-
-fn json_continue_forward(
-    payload: Vec<u8>,
-    forward_to: Vec<u8>,
-    extra_tlvs: Vec<u8>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "result": "continue",
-        "payload": hex::encode(payload),
-        "forward_to": hex::encode(forward_to),
-        "extra_tlvs": hex::encode(extra_tlvs)
-    })
-}
-
-fn json_fail(failure_code: &str) -> serde_json::Value {
-    serde_json::json!({
-        "result": "fail",
-        "failure_message": failure_code
-    })
-}
-
-async fn handle_session_events(
-    plugin: Plugin<State>,
-    mut rx: mpsc::UnboundedReceiver<SessionEventEnvelope>,
-) {
-    while let Some(envelope) = rx.recv().await {
-        debug!("session event: {envelope:?}");
-        publish_notification(&plugin, envelope.into()).await;
-    }
-}
-
-/// Publishes any `LspNotification` under its topic. Generic across
-/// notification kinds so future non-session notifications reuse this same
-/// path instead of a bespoke publisher.
-async fn publish_notification(plugin: &Plugin<State>, notification: LspNotification) {
-    let topic = notification.topic();
-
-    let payload = match serde_json::to_value(&notification) {
-        Ok(value) => value,
-        Err(e) => {
-            warn!("failed to serialize {topic} notification: {e}");
-            return;
-        }
-    };
-
-    if let Err(e) = plugin
-        .send_custom_notification(topic.to_string(), payload)
-        .await
-    {
-        warn!("failed to send {topic} notification: {e}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const EXTRA_FEE_TLV_TYPE: u64 = 65537;
-
-    fn forward_response(fee_msat: u64) -> HtlcResponse {
-        HtlcResponse::Forward {
-            channel_id: "ab".repeat(32),
-            fee_msat,
-            forward_msat: 1_000,
-        }
-    }
-
-    fn extra_tlvs_of(resp: &serde_json::Value) -> TlvStream {
-        let hex_str = resp.get("extra_tlvs").unwrap().as_str().unwrap();
-        TlvStream::from_bytes(&hex::decode(hex_str).unwrap()).unwrap()
-    }
-
-    #[test]
-    fn forward_with_fee_sets_extra_fee_tlv() {
-        let resp = session_response_to_json(
-            forward_response(5_000),
-            &TlvStream::default(),
-            1_000,
-            &None,
-        )
-        .unwrap();
-
-        let tlvs = extra_tlvs_of(&resp);
-        assert_eq!(tlvs.get_u64(EXTRA_FEE_TLV_TYPE).unwrap(), Some(5_000));
-    }
-
-    #[test]
-    fn forward_without_fee_omits_extra_fee_tlv() {
-        // LSPS2: the LSP MUST NOT include the extra_fee TLV if the part
-        // does not have fees deducted.
-        let resp = session_response_to_json(
-            forward_response(0),
-            &TlvStream::default(),
-            1_000,
-            &None,
-        )
-        .unwrap();
-
-        let tlvs = extra_tlvs_of(&resp);
-        assert!(!tlvs.contains(EXTRA_FEE_TLV_TYPE));
-    }
-}
+// use anyhow::bail;
+// use bitcoin::hashes::Hash;
+// use cln_lsps::{
+//     cln_adapters::{
+//         hooks::service_custommsg_hook,
+//         rpc::{
+//             ClnActionExecutor, ClnDatastore, ClnPolicyProvider, ClnRecoveryProvider, ClnRpcClient,
+//         },
+//         sender::ClnSender,
+//         state::ServiceState,
+//         types::HtlcAcceptedRequest,
+//     },
+//     core::{
+//         lsps2::{
+//             actor::HtlcResponse,
+//             event_sink::{ChannelEventSink, EventSink, SessionEventEnvelope},
+//             manager::{ManagerError, PaymentHash, SessionConfig, SessionManager},
+//             provider::{DatastoreProvider, RecoveryProvider},
+//             service::Lsps2ServiceHandler,
+//             session::{HtlcId, PaymentPart},
+//         },
+//         notification::{self, LspNotification},
+//         server::LspsService,
+//         tlv::{TLV_FORWARD_AMT, TlvStream},
+//     },
+//     proto::{
+//         lsps0::{LSPS0_MESSAGE_TYPE, Msat, ShortChannelId},
+//         lsps2::failure_codes::{TEMPORARY_CHANNEL_FAILURE, UNKNOWN_NEXT_PEER},
+//     },
+// };
+// use cln_plugin::{HookBuilder, HookFilter, Plugin, messages::NotificationTopic, options};
+// use log::{debug, error, trace, warn};
+// use std::path::{Path, PathBuf};
+// use std::sync::Arc;
+// use tokio::sync::mpsc;
+//
+// pub const OPTION_ENABLED: options::FlagConfigOption = options::ConfigOption::new_flag(
+//     "experimental-lsps2-service",
+//     "Enables lsps2 for the LSP service",
+// );
+//
+// pub const OPTION_PROMISE_SECRET: options::StringConfigOption =
+//     options::ConfigOption::new_str_no_default(
+//         "experimental-lsps2-promise-secret",
+//         "A 64-character hex string that is the secret for promises",
+//     );
+//
+// pub const OPTION_COLLECT_TIMEOUT: options::DefaultIntegerConfigOption =
+//     options::ConfigOption::new_i64_with_default(
+//         "dev-lsps2-collect-timeout",
+//         90,
+//         "Timeout in seconds for collecting MPP parts (default: 90)",
+//     );
+//
+// /// Opt-in: require no channel reserve from the client on JIT channels.
+// /// Left unset by default as some implementations cannot handle an explicit
+// /// zero reserve.
+// pub const OPTION_ZERO_RESERVE: options::FlagConfigOption = options::ConfigOption::new_flag(
+//     "experimental-lsps2-zero-reserve",
+//     "Require no channel reserve from the client on JIT channels",
+// );
+//
+// #[derive(Clone)]
+// struct State {
+//     lsps_service: Arc<LspsService>,
+//     sender: ClnSender,
+//     lsps2_enabled: bool,
+//     datastore: Arc<ClnDatastore>,
+//     recovery: Arc<ClnRecoveryProvider>,
+//     session_manager: Arc<SessionManager<ClnDatastore, ClnActionExecutor>>,
+// }
+//
+// impl State {
+//     pub fn new<E: EventSink + 'static>(
+//         rpc_path: PathBuf,
+//         promise_secret: &[u8; 32],
+//         collect_timeout_secs: u64,
+//         zero_reserve: bool,
+//         event_sink: E,
+//     ) -> Self {
+//         let rpc = ClnRpcClient::new(rpc_path.clone());
+//         let sender = ClnSender::new(rpc_path);
+//         let datastore = Arc::new(ClnDatastore::new(rpc.clone()));
+//         let policy = Arc::new(ClnPolicyProvider::new(rpc.clone()));
+//         let executor = Arc::new(ClnActionExecutor::new(rpc.clone(), zero_reserve));
+//         let recovery = Arc::new(ClnRecoveryProvider::new(rpc));
+//         let lsps2_handler = Arc::new(Lsps2ServiceHandler::new(
+//             datastore.clone(),
+//             policy,
+//             promise_secret,
+//         ));
+//         let lsps_service = Arc::new(LspsService::builder().with_protocol(lsps2_handler).build());
+//         let session_manager = Arc::new(SessionManager::new(
+//             datastore.clone(),
+//             executor,
+//             SessionConfig {
+//                 collect_timeout_secs,
+//                 ..SessionConfig::default()
+//             },
+//             Arc::new(event_sink),
+//         ));
+//         Self {
+//             lsps_service,
+//             sender,
+//             lsps2_enabled: true,
+//             datastore,
+//             recovery,
+//             session_manager,
+//         }
+//     }
+// }
+//
+// impl ServiceState for State {
+//     fn service(&self) -> Arc<LspsService> {
+//         self.lsps_service.clone()
+//     }
+//
+//     fn sender(&self) -> cln_lsps::cln_adapters::sender::ClnSender {
+//         self.sender.clone()
+//     }
+// }
+//
+// #[tokio::main]
+// async fn main() -> Result<(), anyhow::Error> {
+//     if let Some(plugin) = cln_plugin::Builder::new(tokio::io::stdin(), tokio::io::stdout())
+//         .option(OPTION_ENABLED)
+//         .option(OPTION_PROMISE_SECRET)
+//         .option(OPTION_COLLECT_TIMEOUT)
+//         .option(OPTION_ZERO_RESERVE)
+//         // FIXME: Temporarily disabled lsp feature to please test cases, this is
+//         // ok as the feature is optional per spec.
+//         // We need to ensure that `connectd` only starts after all plugins have
+//         // been initialized.
+//         // .featurebits(
+//         //     cln_plugin::FeatureBitsKind::Node,
+//         //     util::feature_bit_to_hex(LSP_FEATURE_BIT),
+//         // )
+//         // .featurebits(
+//         //     cln_plugin::FeatureBitsKind::Init,
+//         //     util::feature_bit_to_hex(LSP_FEATURE_BIT),
+//         // )
+//         .hook_from_builder(
+//             HookBuilder::new("custommsg", service_custommsg_hook)
+//                 .filters(vec![HookFilter::Int(i64::from(LSPS0_MESSAGE_TYPE))]),
+//         )
+//         .hook("htlc_accepted", on_htlc_accepted)
+//         .subscribe("forward_event", on_forward_event)
+//         .subscribe("block_added", on_block_added)
+//         .notification(NotificationTopic::new(notification::LSPS2_SESSION_EVENT_TOPIC))
+//         .configure()
+//         .await?
+//     {
+//         let rpc_path =
+//             Path::new(&plugin.configuration().lightning_dir).join(&plugin.configuration().rpc_file);
+//
+//         if plugin.option(&OPTION_ENABLED)? {
+//             log::debug!("lsps2-service enabled");
+//             if let Some(secret_hex) = plugin.option(&OPTION_PROMISE_SECRET)? {
+//                 let secret_hex = secret_hex.trim().to_lowercase();
+//
+//                 let decoded_bytes = match hex::decode(&secret_hex) {
+//                     Ok(bytes) => bytes,
+//                     Err(_) => {
+//                         return plugin
+//                             .disable(&format!(
+//                                 "Invalid hex string for promise secret: {}",
+//                                 secret_hex
+//                             ))
+//                             .await;
+//                     }
+//                 };
+//
+//                 let secret: [u8; 32] = match decoded_bytes.try_into() {
+//                     Ok(array) => array,
+//                     Err(vec) => {
+//                         return plugin
+//                             .disable(&format!(
+//                                 "Promise secret must be exactly 32 bytes, got {}",
+//                                 vec.len()
+//                             ))
+//                             .await;
+//                     }
+//                 };
+//
+//                 let collect_timeout_secs = plugin.option(&OPTION_COLLECT_TIMEOUT)? as u64;
+//                 let zero_reserve = plugin.option(&OPTION_ZERO_RESERVE)?;
+//
+//                 let (event_sink, event_rx) = ChannelEventSink::new();
+//
+//                 let state = State::new(rpc_path, &secret, collect_timeout_secs, zero_reserve, event_sink);
+//
+//                 // Recover in-flight sessions before processing replayed HTLCs
+//                 let recovery: Arc<dyn RecoveryProvider> = state.recovery.clone();
+//                 if let Err(e) = state.session_manager.recover(recovery).await {
+//                     warn!("session recovery failed: {e}");
+//                 }
+//
+//                 debug!("startstartstart");
+//
+//                 let plugin = plugin.start(state).await?;
+//                 tokio::spawn(handle_session_events(plugin.clone(), event_rx));
+//                 plugin.join().await
+//             } else {
+//                 bail!("lsps2 enabled but no promise-secret set.");
+//             }
+//         } else {
+//             return plugin
+//                 .disable(&format!("`{}` not enabled", &OPTION_ENABLED.name))
+//                 .await;
+//         }
+//     } else {
+//         Ok(())
+//     }
+// }
+//
+// async fn on_htlc_accepted(
+//     p: Plugin<State>,
+//     v: serde_json::Value,
+// ) -> Result<serde_json::Value, anyhow::Error> {
+//     Ok(handle_htlc_safe(&p, v).await)
+// }
+//
+// async fn handle_htlc_safe(p: &Plugin<State>, v: serde_json::Value) -> serde_json::Value {
+//     match handle_htlc_inner(p, v).await {
+//         Ok(response) => response,
+//         Err(e) => {
+//             error!("HTLC hook error (continuing): {:#}", e);
+//             json_continue()
+//         }
+//     }
+// }
+//
+// async fn handle_htlc_inner(
+//     p: &Plugin<State>,
+//     v: serde_json::Value,
+// ) -> Result<serde_json::Value, anyhow::Error> {
+//     if !p.state().lsps2_enabled {
+//         return Ok(json_continue());
+//     }
+//
+//     let req: HtlcAcceptedRequest = serde_json::from_value(v)?;
+//
+//     let short_channel_id: ShortChannelId = match req.onion.short_channel_id {
+//         Some(scid) => scid.into(),
+//         None => {
+//             trace!("We are the destination of the HTLC, continue.");
+//             return Ok(json_continue());
+//         }
+//     };
+//
+//     // Probe: an scid we have no buy request for is not ours. Everything
+//     // else about the entry — expiry included — is the session manager's
+//     // call, so that it can tell a stale offer from a live session.
+//     if p.state()
+//         .datastore
+//         .get_buy_request(&short_channel_id)
+//         .await
+//         .is_err()
+//     {
+//         trace!("SCID not ours, continue.");
+//         return Ok(json_continue());
+//     }
+//
+//     handle_session_htlc(p, &req, short_channel_id).await
+// }
+//
+// async fn handle_session_htlc(
+//     p: &Plugin<State>,
+//     req: &HtlcAcceptedRequest,
+//     scid: ShortChannelId,
+// ) -> Result<serde_json::Value, anyhow::Error> {
+//     let payment_hash = PaymentHash::from_byte_array(req.htlc.payment_hash.as_slice().try_into()?);
+//     let part = PaymentPart {
+//         // HTLC ids are per-channel; key by the incoming channel too so MPP
+//         // parts arriving over different channels cannot collide.
+//         htlc_id: HtlcId {
+//             scid: req.htlc.short_channel_id.into(),
+//             id: req.htlc.id,
+//         },
+//         amount_msat: Msat::from_msat(req.htlc.amount_msat.msat()),
+//         cltv_expiry: req.htlc.cltv_expiry,
+//     };
+//     match p
+//         .state()
+//         .session_manager
+//         .on_part(payment_hash, scid, part)
+//         .await
+//     {
+//         Ok(resp) => session_response_to_json(
+//             resp,
+//             &req.onion.payload,
+//             req.htlc.amount_msat.msat(),
+//             &req.htlc.extra_tlvs,
+//         ),
+//         Err(e) => {
+//             debug!("session manager error: {e:#}");
+//             match e {
+//                 // The scid points at us but no session can serve this part
+//                 // right now; tell the payer it may retry.
+//                 ManagerError::SessionTerminated | ManagerError::SessionAlreadyFunded => {
+//                     Ok(json_fail(TEMPORARY_CHANNEL_FAILURE))
+//                 }
+//                 // The offer is past valid_until: permanent for this scid.
+//                 ManagerError::OfferExpired => Ok(json_fail(UNKNOWN_NEXT_PEER)),
+//                 ManagerError::DatastoreLookup(_) => Ok(json_continue()),
+//             }
+//         }
+//     }
+// }
+//
+// fn session_response_to_json(
+//     resp: HtlcResponse,
+//     payload: &TlvStream,
+//     _htlc_amount_msat: u64,
+//     extra_tlvs: &Option<TlvStream>,
+// ) -> Result<serde_json::Value, anyhow::Error> {
+//     match resp {
+//         HtlcResponse::Forward {
+//             channel_id,
+//             fee_msat,
+//             forward_msat,
+//         } => {
+//             let mut payload = payload.clone();
+//             payload.set_tu64(TLV_FORWARD_AMT, forward_msat);
+//
+//             let mut extra_tlvs = extra_tlvs.clone().unwrap_or_default();
+//             // LSPS2: the extra_fee TLV MUST NOT be included on parts that
+//             // have no fee deducted.
+//             if fee_msat > 0 {
+//                 extra_tlvs.set_u64(65537, fee_msat);
+//             }
+//
+//             let forward_to = hex::decode(&channel_id)?;
+//
+//             Ok(json_continue_forward(
+//                 payload.to_bytes()?,
+//                 forward_to,
+//                 extra_tlvs.to_bytes()?,
+//             ))
+//         }
+//         HtlcResponse::Fail { failure_code } => Ok(json_fail(failure_code)),
+//         HtlcResponse::Continue => Ok(json_continue()),
+//     }
+// }
+//
+// async fn on_forward_event(p: Plugin<State>, v: serde_json::Value) -> Result<(), anyhow::Error> {
+//     let event = match v.get("forward_event") {
+//         Some(e) => e,
+//         None => return Ok(()),
+//     };
+//
+//     let status = event.get("status").and_then(|s| s.as_str());
+//
+//     let payment_hash = match status {
+//         Some("settled") | Some("failed") | Some("local_failed") => {
+//             let hash_hex = match event.get("payment_hash").and_then(|s| s.as_str()) {
+//                 Some(h) => h,
+//                 None => return Ok(()),
+//             };
+//             let bytes: [u8; 32] = hex::decode(hash_hex)?
+//                 .try_into()
+//                 .map_err(|v: Vec<u8>| anyhow::anyhow!("bad payment_hash len {}", v.len()))?;
+//             PaymentHash::from_byte_array(bytes)
+//         }
+//         _ => return Ok(()),
+//     };
+//
+//     let updated_index = event.get("updated_index").and_then(|v| v.as_u64());
+//
+//     match status {
+//         Some("settled") => {
+//             let preimage = event
+//                 .get("preimage")
+//                 .and_then(|s| s.as_str())
+//                 .map(|s| s.to_string());
+//
+//             if let Err(e) = p
+//                 .state()
+//                 .session_manager
+//                 .on_payment_settled(payment_hash, preimage, updated_index)
+//                 .await
+//             {
+//                 debug!("on_payment_settled error: {e:#}");
+//             }
+//         }
+//         Some("failed") | Some("local_failed") => {
+//             // Identify the failed part when possible so the session can
+//             // keep waiting on its other, still-offered parts.
+//             let failed_htlc = match (
+//                 event
+//                     .get("in_channel")
+//                     .and_then(|v| v.as_str())
+//                     .and_then(|s| s.parse::<ShortChannelId>().ok()),
+//                 event.get("in_htlc_id").and_then(|v| v.as_u64()),
+//             ) {
+//                 (Some(scid), Some(id)) => Some(HtlcId { scid, id }),
+//                 _ => None,
+//             };
+//
+//             if let Err(e) = p
+//                 .state()
+//                 .session_manager
+//                 .on_payment_failed(payment_hash, updated_index, failed_htlc)
+//                 .await
+//             {
+//                 debug!("on_payment_failed error: {e:#}");
+//             }
+//         }
+//         _ => unreachable!(),
+//     }
+//
+//     Ok(())
+// }
+//
+// async fn on_block_added(p: Plugin<State>, v: serde_json::Value) -> Result<(), anyhow::Error> {
+//     let height = match v
+//         .get("block_added")
+//         .and_then(|b| b.get("height"))
+//         .and_then(|h| h.as_u64())
+//     {
+//         Some(h) => h as u32,
+//         None => return Ok(()),
+//     };
+//
+//     p.state().session_manager.on_new_block(height).await;
+//     Ok(())
+// }
+//
+// fn json_continue() -> serde_json::Value {
+//     serde_json::json!({"result": "continue"})
+// }
+//
+// fn json_continue_forward(
+//     payload: Vec<u8>,
+//     forward_to: Vec<u8>,
+//     extra_tlvs: Vec<u8>,
+// ) -> serde_json::Value {
+//     serde_json::json!({
+//         "result": "continue",
+//         "payload": hex::encode(payload),
+//         "forward_to": hex::encode(forward_to),
+//         "extra_tlvs": hex::encode(extra_tlvs)
+//     })
+// }
+//
+// fn json_fail(failure_code: &str) -> serde_json::Value {
+//     serde_json::json!({
+//         "result": "fail",
+//         "failure_message": failure_code
+//     })
+// }
+//
+// async fn handle_session_events(
+//     plugin: Plugin<State>,
+//     mut rx: mpsc::UnboundedReceiver<SessionEventEnvelope>,
+// ) {
+//     while let Some(envelope) = rx.recv().await {
+//         debug!("session event: {envelope:?}");
+//         publish_notification(&plugin, envelope.into()).await;
+//     }
+// }
+//
+// /// Publishes any `LspNotification` under its topic. Generic across
+// /// notification kinds so future non-session notifications reuse this same
+// /// path instead of a bespoke publisher.
+// async fn publish_notification(plugin: &Plugin<State>, notification: LspNotification) {
+//     let topic = notification.topic();
+//
+//     let payload = match serde_json::to_value(&notification) {
+//         Ok(value) => value,
+//         Err(e) => {
+//             warn!("failed to serialize {topic} notification: {e}");
+//             return;
+//         }
+//     };
+//
+//     if let Err(e) = plugin
+//         .send_custom_notification(topic.to_string(), payload)
+//         .await
+//     {
+//         warn!("failed to send {topic} notification: {e}");
+//     }
+// }
+//
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//
+//     const EXTRA_FEE_TLV_TYPE: u64 = 65537;
+//
+//     fn forward_response(fee_msat: u64) -> HtlcResponse {
+//         HtlcResponse::Forward {
+//             channel_id: "ab".repeat(32),
+//             fee_msat,
+//             forward_msat: 1_000,
+//         }
+//     }
+//
+//     fn extra_tlvs_of(resp: &serde_json::Value) -> TlvStream {
+//         let hex_str = resp.get("extra_tlvs").unwrap().as_str().unwrap();
+//         TlvStream::from_bytes(&hex::decode(hex_str).unwrap()).unwrap()
+//     }
+//
+//     #[test]
+//     fn forward_with_fee_sets_extra_fee_tlv() {
+//         let resp = session_response_to_json(
+//             forward_response(5_000),
+//             &TlvStream::default(),
+//             1_000,
+//             &None,
+//         )
+//         .unwrap();
+//
+//         let tlvs = extra_tlvs_of(&resp);
+//         assert_eq!(tlvs.get_u64(EXTRA_FEE_TLV_TYPE).unwrap(), Some(5_000));
+//     }
+//
+//     #[test]
+//     fn forward_without_fee_omits_extra_fee_tlv() {
+//         // LSPS2: the LSP MUST NOT include the extra_fee TLV if the part
+//         // does not have fees deducted.
+//         let resp = session_response_to_json(
+//             forward_response(0),
+//             &TlvStream::default(),
+//             1_000,
+//             &None,
+//         )
+//         .unwrap();
+//
+//         let tlvs = extra_tlvs_of(&resp);
+//         assert!(!tlvs.contains(EXTRA_FEE_TLV_TYPE));
+//     }
+// }
