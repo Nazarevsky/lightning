@@ -122,6 +122,7 @@ impl ServiceState for State {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    debug!("startstartstart");
     if let Some(plugin) = cln_plugin::Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .option(OPTION_ENABLED)
         .option(OPTION_PROMISE_SECRET)
