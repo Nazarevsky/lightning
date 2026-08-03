@@ -1,5 +1,6 @@
 //! Lsps2 Service FSM
 
+use log::info;
 use log::debug;
 use crate::proto::{
     lsps0::{Msat, ShortChannelId},
