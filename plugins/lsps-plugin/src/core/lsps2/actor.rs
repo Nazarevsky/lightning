@@ -486,6 +486,7 @@ impl<A: ActionExecutor + Clone + Send + 'static, D: DatastoreProvider + Clone + 
                         }
                         Err(e) => {
                             warn!("fund_channel failed: {e}");
+                            debug!("fund_channel failed: {e}");
 
                             // Under the hood, fund_channel performes a serie of RPC calls.
                             // fund_psbt, which is also called, may return an error which 
